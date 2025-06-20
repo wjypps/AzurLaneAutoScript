@@ -1,0 +1,73 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # 每小时同步一次
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # 步骤1：检出当前仓库（包含您的工作流配置）
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: 'master'
+          fetch-depth: 0
+          persist-credentials: true  # 保留推送凭证
+
+      # 步骤2：配置Git身份
+      - name: Setup Git identity
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+      # 步骤3：创建本地备份分支（保护.github目录）
+      - name: Create backup branch
+        run: |
+          git checkout -b actions-backup
+          git push origin actions-backup
+          
+      # 步骤4：同步上游代码（排除.github目录）
+      - name: Sync upstream (excluding .github)
+        run: |
+          # 添加上游仓库
+          git remote add upstream https://github.com/LmeSzinc/AzurLaneAutoScript.git || true
+          
+          # 获取上游更新
+          git fetch upstream
+          
+          # 创建临时分支用于同步
+          git checkout -b upstream-sync upstream/master
+          
+          # 删除除.github外的所有内容
+          find . -path ./.git -prune -o \( ! -path "./.github/*" \) -delete
+          
+          # 将上游内容复制到当前分支（排除.github）
+          git checkout upstream-sync -- .
+          git rm -r --cached .github  # 确保.github不被包含
+          
+          # 切换回主分支并合并
+          git checkout master
+          git merge upstream-sync --allow-unrelated-histories -X theirs -m "Sync upstream (preserve .github)"
+          
+          # 清理临时分支
+          git branch -D upstream-sync
+
+      # 步骤5：恢复本地.github配置
+      - name: Restore .github configuration
+        run: |
+          git checkout actions-backup -- .github
+          git add .github
+          git commit -m "Restore local .github configuration" || echo "No changes to commit"
+
+      # 步骤6：推送到仓库
+      - name: Push to origin
+        run: git push origin master --force
+        
+      # 步骤7：清理备份分支
+      - name: Cleanup backup branch
+        run: |
+          git push origin --delete actions-backup
+          git branch -D actions-backup
