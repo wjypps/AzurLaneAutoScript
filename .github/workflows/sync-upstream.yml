@@ -1,0 +1,49 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: 'master'
+          fetch-depth: 1  # 只获取最新提交
+
+      - name: Setup Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Sync upstream with .github protection
+        run: |
+          # 1. 备份当前 .github 目录
+          echo "备份 .github 目录"
+          rm -rf /tmp/github_backup
+          cp -r .github /tmp/github_backup
+          
+          # 2. 添加上游仓库
+          git remote add upstream https://github.com/LmeSzinc/AzurLaneAutoScript.git || true
+          
+          # 3. 获取上游最新代码
+          git fetch upstream master --depth=1
+          
+          # 4. 重置到上游最新状态
+          git reset --hard upstream/master
+          
+          # 5. 恢复 .github 目录
+          echo "恢复 .github 目录"
+          rm -rf .github
+          mv /tmp/github_backup .github
+          
+          # 6. 添加并提交恢复的目录
+          git add .github
+          git commit -m "恢复本地 .github 配置" || echo "无变更，跳过提交"
+          
+          # 7. 强制推送到当前仓库
+          git push origin master --force
