@@ -1,0 +1,51 @@
+name: Sync to Gitee
+
+on:
+  push:
+    branches: [ "master" ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 创建临时目录
+      - name: Create workspace
+        run: mkdir -p /tmp/gitee-mirror
+        
+      # 2. 初始化新的Git仓库
+      - name: Initialize new repository
+        run: |
+          cd /tmp/gitee-mirror
+          git init
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+      # 3. 添加Gitee远程仓库
+      - name: Add Gitee Remote
+        run: |
+          cd /tmp/gitee-mirror
+          git remote add gitee https://${{ secrets.GITEE_USERNAME }}:${{ secrets.GITEE_ACCESS_TOKEN }}@gitee.com/${{ secrets.GITEE_USERNAME }}/AzurLaneAutoScript.git
+          
+      # 4. 从GitHub获取最新代码
+      - name: Fetch GitHub content
+        run: |
+          cd /tmp/gitee-mirror
+          git fetch https://github.com/${{ github.repository }}.git master --depth=1
+          git reset --hard FETCH_HEAD
+          
+      # 5. 创建新的根提交
+      - name: Create new root commit
+        run: |
+          cd /tmp/gitee-mirror
+          git checkout --orphan new-master
+          git add -A
+          git commit -m "Minimal commit for Gitee"
+          
+      # 6. 强制推送到Gitee
+      - name: Push to Gitee
+        run: |
+          cd /tmp/gitee-mirror
+          git push gitee new-master:master --force
