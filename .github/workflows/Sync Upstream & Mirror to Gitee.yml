@@ -1,0 +1,82 @@
+name: Sync Upstream & Mirror to Gitee
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 每小时检查一次
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: 'master'
+          fetch-depth: 1
+
+      - name: Setup Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      # ---------- 0. 检测上游是否有更新 ----------
+      - name: Check upstream changes
+        id: check
+        run: |
+          git remote add upstream https://github.com/LmeSzinc/AzurLaneAutoScript.git || true
+          git fetch upstream master --depth=1
+          if git diff --quiet upstream/master HEAD -- . ':(exclude).github'; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "上游无更新，跳过。"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "上游有更新，准备同步。"
+          fi
+
+      # ---------- 1. 同步上游到 GitHub（保护 .github） ----------
+      - name: Sync upstream to GitHub
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          rm -rf /tmp/github_backup
+          cp -r .github /tmp/github_backup
+
+          git reset --hard upstream/master
+
+          rm -rf .github
+          mv /tmp/github_backup .github
+          git add .github
+          git commit -m "chore: restore local .github config" || echo "no changes"
+          git push origin master --force
+
+      # ---------- 2. 镜像到 Gitee ----------
+      - name: Mirror to Gitee
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+          GITEE_TOKEN: ${{ secrets.GITEE_ACCESS_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_USERNAME }}/AzurLaneAutoScript.git
+        run: |
+          set -e
+          WORK=/tmp/gitee-mirror
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          git init -q -b master
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch -q --depth=1 origin master
+          git reset -q --hard FETCH_HEAD
+
+          git checkout -q --orphan gitee-master
+          git add -A
+          git commit -q -m "Mirror sync $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+          git remote add gitee "https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}"
+          git push gitee gitee-master:master --force
