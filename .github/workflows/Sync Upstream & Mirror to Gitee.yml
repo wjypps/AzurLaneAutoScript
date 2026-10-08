@@ -1,0 +1,83 @@
+name: Sync Upstream & Mirror to Gitee
+
+on:
+  schedule:
+    - cron: '15 * * * *'   # 每小时检查一次
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: 'master'
+          fetch-depth: 1
+
+      - name: Setup Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          # 【关键配置】解决 Gitee 推送大仓库时的 postBuffer 和超时问题
+          git config --global http.postBuffer 524288000
+          git config --global http.version HTTP/1.1
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+
+      # ---------- 0. 检测上游是否有更新 ----------
+      - name: Check upstream changes
+        id: check
+        run: |
+          git remote add upstream https://github.com/LmeSzinc/AzurLaneAutoScript.git || true
+          git fetch upstream master --depth=1
+          if git diff --quiet upstream/master HEAD -- . ':(exclude).github'; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "上游无更新，跳过。"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "上游有更新，准备同步。"
+          fi
+
+      # ---------- 1. 同步上游到 GitHub（保护 .github） ----------
+      - name: Sync upstream to GitHub
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          rm -rf /tmp/github_backup
+          cp -r .github /tmp/github_backup
+
+          git reset --hard upstream/master
+
+          rm -rf .github
+          mv /tmp/github_backup .github
+          git add .github
+          git commit -m "chore: restore local .github config" || echo "no changes"
+          git push origin master --force
+
+      # ---------- 2. 镜像到 Gitee ----------
+      - name: Mirror to Gitee
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+          GITEE_TOKEN: ${{ secrets.GITEE_ACCESS_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_USERNAME }}/AzurLaneAutoScript.git
+        run: |
+          set -e
+          
+          # 【关键修改 1】恢复使用 --orphan 孤儿分支
+          # 因为当前工作区是 fetch-depth: 1 的浅克隆，Gitee 会拒绝接收浅层历史 (shallow update not allowed)。
+          # 使用孤儿分支会将当前的所有文件打包成一个全新的初始提交，Gitee 完全接受这种形式。
+          git checkout -q --orphan gitee-master
+          git add -A
+          git commit -q -m "Mirror sync $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+          # 【关键修改 2】清理旧远程并重新添加 Gitee
+          git remote remove gitee || true
+          git remote add gitee "https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}"
+          
+          echo "正在推送到 Gitee（由于仓库较大，可能需要几分钟）..."
+          # 强制推送，覆盖 Gitee 上的历史
+          git push gitee gitee-master:master --force -v
