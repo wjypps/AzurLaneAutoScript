@@ -1,0 +1,159 @@
+name: Sync Upstream & Mirror to Gitee
+
+on:
+  schedule:
+    # 【为什么是两条 cron】
+    # GitHub 的 schedule 事件是 best-effort：高负载时会延迟，负载过高时排队的
+    # job 会被直接丢弃（官方文档 events-that-trigger-workflows）。
+    # 本仓库实测 2026-09-11 ~ 10-14 期间单条 '15 * * * *' 应有约 792 次运行，
+    # 实际只跑了 177 次（丢失约 78%），并且 2026-10-19 之后彻底不再触发，
+    # 导致上游 10-20 之后的更新一直没有同步进来。
+    # 因此改为两条错开分钟的 cron 互为备份，避开整点（整点是官方点名的高负载时段）。
+    - cron: '7 * * * *'
+    - cron: '37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 防止上一次运行（推 Gitee 很慢）还没结束就叠加下一次
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: 'master'
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Setup Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          # 【关键配置】解决 Gitee 推送大仓库时的 postBuffer 和超时问题
+          git config --global http.postBuffer 524288000
+          git config --global http.version HTTP/1.1
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+
+      # ---------- 0. 检测上游是否有更新 ----------
+      - name: Check upstream changes
+        id: check
+        run: |
+          git remote add upstream https://github.com/LmeSzinc/AzurLaneAutoScript.git || true
+          git fetch upstream master --depth=1
+
+          UPSTREAM_SHA=$(git rev-parse upstream/master)
+          CURRENT_SHA=$(git rev-parse HEAD)
+          echo "upstream=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT_SHA" >> "$GITHUB_OUTPUT"
+
+          # .github 由本仓库自己维护，不参与比较
+          # 注意：这里是 fetch-depth: 1 的浅克隆，git rev-list --count 拿不到真实提交数
+          # （实测只会返回 1），所以用差异文件数来衡量落后程度。
+          CHANGED_FILES=$(git diff --name-only upstream/master HEAD -- . ':(exclude).github' | wc -l | tr -d ' ')
+
+          {
+            echo "### 上游同步检查"
+            echo ""
+            echo "| 项目 | 提交 |"
+            echo "| --- | --- |"
+            echo "| 上游 LmeSzinc/master | \`$UPSTREAM_SHA\` |"
+            echo "| 本仓库当前 master | \`$CURRENT_SHA\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if git diff --quiet upstream/master HEAD -- . ':(exclude).github'; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::上游无更新，跳过同步。"
+            {
+              echo ""
+              echo "**结论：上游无更新，跳过。**"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::上游有更新，准备同步（$CHANGED_FILES 个文件有差异）。"
+            {
+              echo ""
+              echo "**结论：上游有更新，准备同步。** 共 \`$CHANGED_FILES\` 个文件有差异。"
+              echo ""
+              echo "<details><summary>差异文件</summary>"
+              echo ""
+              echo '```'
+              git diff --stat upstream/master HEAD -- . ':(exclude).github' | tail -30
+              echo '```'
+              echo ""
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ---------- 1. 同步上游到 GitHub（只保护 .github/workflows） ----------
+      - name: Sync upstream to GitHub
+        if: steps.check.outputs.changed == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.check.outputs.upstream }}
+        run: |
+          set -e
+
+          # 【修复】原逻辑备份整个 .github 再整体还原，
+          # 会连带删掉上游的 .github/ISSUE_TEMPLATE/*。
+          # 2026-10-19 那次同步就因此删掉了 4 个 issue 模板。
+          # 本仓库真正需要保留的只有自己的 workflow，这里只保护 .github/workflows。
+          rm -rf /tmp/workflows_backup
+          mkdir -p /tmp/workflows_backup
+          cp -r .github/workflows /tmp/workflows_backup/
+
+          git reset --hard upstream/master
+
+          mkdir -p .github
+          rm -rf .github/workflows
+          cp -r /tmp/workflows_backup/workflows .github/workflows
+
+          git add -A
+          if git diff --cached --quiet; then
+            # 理论上不会走到这里（上游没有 .github/workflows，还原后必有变更），
+            # 但保留兜底：即使无需提交，也要确保 master 指向上游最新提交。
+            echo "::notice::工作区与上游一致，无需新建提交。"
+          else
+            git commit -m "chore: sync upstream $(git rev-parse --short upstream/master) and restore local workflows"
+          fi
+
+          # 无论是否有新提交都推送：reset --hard 之后本地 master 已指向上游提交，
+          # 只有 push 出去远端才会真正更新。
+          # force-with-lease：远端被别人改过就失败报错，而不是静默覆盖。
+          git push origin master --force-with-lease
+          echo "::notice::已同步上游 $UPSTREAM_SHA 到 master。"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "已推送 \`$(git rev-parse --short HEAD)\` 到 GitHub master。" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 2. 镜像到 Gitee ----------
+      - name: Mirror to Gitee
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+          GITEE_TOKEN: ${{ secrets.GITEE_ACCESS_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_USERNAME }}/AzurLaneAutoScript.git
+        run: |
+          set -e
+
+          # 使用 --orphan 孤儿分支：
+          # 当前工作区是 fetch-depth: 1 的浅克隆，Gitee 会拒绝接收浅层历史
+          # (shallow update not allowed)。孤儿分支会把当前所有文件打包成
+          # 一个全新的初始提交，Gitee 完全接受这种形式。
+          git checkout -q --orphan gitee-master
+          git add -A
+          git commit -q -m "Mirror sync $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+          git remote remove gitee || true
+          git remote add gitee "https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}"
+
+          echo "正在推送到 Gitee（由于仓库较大，可能需要几分钟）..."
+          git push gitee gitee-master:master --force -v
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "已镜像到 Gitee（$(date -u +'%Y-%m-%d %H:%M:%S UTC')）。" >> "$GITHUB_STEP_SUMMARY"
